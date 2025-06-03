@@ -1,667 +1,635 @@
 # 功能域映射 
-# enhanced_interplm/hierarchical_mapping/cross_level_integrator.py
+# enhanced_interplm/hierarchical_mapping/domain_function.py
 
 """
-Advanced cross-level integration for hierarchical protein analysis.
+Advanced domain and functional region mapping.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, List, Tuple, Optional, Union
-import networkx as nx
+from typing import Dict, List, Tuple, Optional, Set, Union
+from dataclasses import dataclass
 from scipy.spatial.distance import cdist
+from sklearn.cluster import DBSCAN
+import networkx as nx
 
 
-class HierarchicalGraphIntegrator(nn.Module):
+@dataclass
+class ProteinDomain:
+    """Container for protein domain information."""
+    domain_id: str
+    domain_type: str
+    start: int
+    end: int
+    confidence: float
+    subfamily: Optional[str] = None
+    functional_sites: Optional[List[int]] = None
+    interactions: Optional[List[str]] = None
+
+
+class AdvancedDomainMapper(nn.Module):
     """
-    Integrates features across hierarchical levels using graph neural networks.
+    Advanced protein domain detection and functional mapping.
     """
     
     def __init__(
         self,
-        aa_dim: int = 64,
-        ss_dim: int = 128,
-        domain_dim: int = 256,
-        protein_dim: int = 512,
-        hidden_dim: int = 256,
-        num_heads: int = 8
+        feature_dim: int,
+        hidden_dim: int = 512,
+        num_domain_types: int = 500,  # Extended domain families
+        use_domain_grammar: bool = True,
+        use_coevolution: bool = True
     ):
         super().__init__()
         
-        self.level_dims = {
-            'aa': aa_dim,
-            'ss': ss_dim,
-            'domain': domain_dim,
-            'protein': protein_dim
-        }
+        self.feature_dim = feature_dim
+        self.hidden_dim = hidden_dim
+        self.num_domain_types = num_domain_types
+        self.use_domain_grammar = use_domain_grammar
+        self.use_coevolution = use_coevolution
         
-        # Level-specific encoders with different architectures
-        self.level_encoders = nn.ModuleDict({
-            'aa': self._build_aa_encoder(aa_dim, hidden_dim),
-            'ss': self._build_ss_encoder(ss_dim, hidden_dim),
-            'domain': self._build_domain_encoder(domain_dim, hidden_dim),
-            'protein': self._build_protein_encoder(protein_dim, hidden_dim)
-        })
+        # Multi-resolution domain detection
+        self.domain_convs = nn.ModuleList([
+            # Short domains (20-50 residues)
+            nn.Conv1d(feature_dim, hidden_dim // 4, kernel_size=25, padding=12, stride=5),
+            # Medium domains (50-150 residues)
+            nn.Conv1d(feature_dim, hidden_dim // 4, kernel_size=75, padding=37, stride=10),
+            # Long domains (150-300 residues)
+            nn.Conv1d(feature_dim, hidden_dim // 4, kernel_size=150, padding=75, stride=20),
+            # Very long domains (300+ residues)
+            nn.Conv1d(feature_dim, hidden_dim // 4, kernel_size=300, padding=150, stride=30)
+        ])
         
-        # Cross-level message passing
-        self.bottom_up_gnn = HierarchicalGNN(
-            hidden_dim, num_heads, direction='bottom_up'
+        # Domain boundary refinement
+        self.boundary_refiner = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim // 2,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True
         )
         
-        self.top_down_gnn = HierarchicalGNN(
-            hidden_dim, num_heads, direction='top_down'
+        # Domain type classifier with hierarchical structure
+        self.domain_classifier = HierarchicalDomainClassifier(
+            input_dim=hidden_dim,
+            num_classes=num_domain_types
         )
         
-        # Bidirectional integration
-        self.bidirectional_integrator = BidirectionalIntegrator(
-            hidden_dim, num_heads
+        # Functional site predictor
+        self.functional_site_detector = FunctionalSiteDetector(
+            feature_dim=hidden_dim,
+            num_site_types=10
         )
         
-        # Multi-scale fusion
-        self.scale_fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 4, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim)
-        )
-        
-    def _build_aa_encoder(self, input_dim: int, hidden_dim: int) -> nn.Module:
-        """Build amino acid level encoder."""
-        return nn.Sequential(
-            nn.Linear(input_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.BatchNorm1d(hidden_dim // 2),
-            nn.Linear(hidden_dim // 2, hidden_dim),
-            nn.LayerNorm(hidden_dim)
-        )
-        
-    def _build_ss_encoder(self, input_dim: int, hidden_dim: int) -> nn.Module:
-        """Build secondary structure encoder."""
-        return nn.Sequential(
-            nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm1d(hidden_dim),
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.LayerNorm([hidden_dim])
-        )
-        
-    def _build_domain_encoder(self, input_dim: int, hidden_dim: int) -> nn.Module:
-        """Build domain level encoder."""
-        return nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim)
-        )
-        
-    def _build_protein_encoder(self, input_dim: int, hidden_dim: int) -> nn.Module:
-        """Build protein level encoder."""
-        return nn.Sequential(
-            nn.Linear(input_dim, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim)
-        )
-        
-    def forward(
-        self,
-        features: Dict[str, torch.Tensor],
-        hierarchy: Dict[str, List[Tuple[int, int]]]
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Integrate features across hierarchical levels.
-        
-        Args:
-            features: Dictionary of features at each level
-            hierarchy: Hierarchical relationships between levels
-            
-        Returns:
-            Integrated features at each level
-        """
-        # Encode features at each level
-        encoded = {}
-        
-        for level, feat in features.items():
-            if level in self.level_encoders:
-                encoder = self.level_encoders[level]
-                
-                if level == 'ss':
-                    # Handle conv1d input
-                    feat = feat.transpose(1, 2)
-                    encoded[level] = encoder(feat).transpose(1, 2)
-                elif feat.dim() == 3:
-                    # Flatten batch for linear layers
-                    batch_size, seq_len, feat_dim = feat.shape
-                    feat_flat = feat.view(-1, feat_dim)
-                    encoded_flat = encoder(feat_flat)
-                    encoded[level] = encoded_flat.view(batch_size, seq_len, -1)
-                else:
-                    encoded[level] = encoder(feat)
-                    
-        # Bottom-up message passing
-        bottom_up_features = self.bottom_up_gnn(encoded, hierarchy)
-        
-        # Top-down message passing
-        top_down_features = self.top_down_gnn(bottom_up_features, hierarchy)
-        
-        # Bidirectional integration
-        integrated = self.bidirectional_integrator(
-            bottom_up_features, top_down_features, hierarchy
-        )
-        
-        # Multi-scale fusion for each level
-        fused = {}
-        
-        for level in features.keys():
-            if level in integrated:
-                # Concatenate all scale information
-                level_features = []
-                
-                # Add features from all levels
-                for scale in ['aa', 'ss', 'domain', 'protein']:
-                    if scale in integrated:
-                        scale_feat = integrated[scale]
-                        
-                        # Adjust dimensions to match
-                        if scale != level:
-                            scale_feat = self._adjust_scale(
-                                scale_feat, integrated[level], hierarchy, scale, level
-                            )
-                            
-                        level_features.append(scale_feat)
-                        
-                # Fuse multi-scale features
-                if len(level_features) == 4:
-                    concat_features = torch.cat(level_features, dim=-1)
-                    fused[level] = self.scale_fusion(concat_features)
-                else:
-                    fused[level] = integrated[level]
-                    
-        return fused
-        
-    def _adjust_scale(
-        self,
-        source_feat: torch.Tensor,
-        target_feat: torch.Tensor,
-        hierarchy: Dict[str, List[Tuple[int, int]]],
-        source_level: str,
-        target_level: str
-    ) -> torch.Tensor:
-        """Adjust feature dimensions between different scales."""
-        if source_feat.shape == target_feat.shape:
-            return source_feat
-            
-        # Simple interpolation for now
-        if source_feat.dim() == 3 and target_feat.dim() == 3:
-            # Interpolate sequence dimension
-            source_feat = F.interpolate(
-                source_feat.transpose(1, 2),
-                size=target_feat.shape[1],
-                mode='linear',
-                align_corners=False
-            ).transpose(1, 2)
-            
-        elif source_feat.dim() == 2 and target_feat.dim() == 3:
-            # Expand protein-level to sequence
-            source_feat = source_feat.unsqueeze(1).expand(
-                -1, target_feat.shape[1], -1
+        # Domain grammar module
+        if use_domain_grammar:
+            self.domain_grammar = DomainGrammarModule(
+                hidden_dim=hidden_dim,
+                num_domain_types=num_domain_types
             )
             
-        return source_feat
-
-
-class HierarchicalGNN(nn.Module):
-    """
-    Graph neural network for hierarchical message passing.
-    """
-    
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_heads: int = 8,
-        direction: str = 'bottom_up'
-    ):
-        super().__init__()
-        
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.direction = direction
-        
-        # Message functions for each level transition
-        self.message_functions = nn.ModuleDict({
-            'aa_to_ss': self._build_message_function(),
-            'ss_to_domain': self._build_message_function(),
-            'domain_to_protein': self._build_message_function(),
-            'protein_to_domain': self._build_message_function(),
-            'domain_to_ss': self._build_message_function(),
-            'ss_to_aa': self._build_message_function()
-        })
-        
-        # Update functions
-        self.update_functions = nn.ModuleDict({
-            level: self._build_update_function()
-            for level in ['aa', 'ss', 'domain', 'protein']
-        })
-        
-    def _build_message_function(self) -> nn.Module:
-        """Build message passing function."""
-        return nn.Sequential(
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(self.hidden_dim, self.hidden_dim)
+        # Coevolution analyzer
+        if use_coevolution:
+            self.coevolution_analyzer = CoevolutionAnalyzer(
+                feature_dim=hidden_dim
+            )
+            
+        # Domain interaction predictor
+        self.interaction_predictor = DomainInteractionPredictor(
+            domain_dim=hidden_dim
         )
-        
-    def _build_update_function(self) -> nn.Module:
-        """Build node update function."""
-        return nn.GRUCell(self.hidden_dim, self.hidden_dim)
         
     def forward(
         self,
-        features: Dict[str, torch.Tensor],
-        hierarchy: Dict[str, List[Tuple[int, int]]]
-    ) -> Dict[str, torch.Tensor]:
+        features: torch.Tensor,
+        evolutionary_features: Optional[torch.Tensor] = None,
+        return_intermediates: bool = False
+    ) -> Dict[str, Any]:
         """
-        Perform hierarchical message passing.
-        """
-        updated_features = features.copy()
+        Detect and classify protein domains.
         
-        if self.direction == 'bottom_up':
-            # AA -> SS -> Domain -> Protein
-            transitions = [
-                ('aa', 'ss', 'aa_to_ss'),
-                ('ss', 'domain', 'ss_to_domain'),
-                ('domain', 'protein', 'domain_to_protein')
-            ]
-        else:
-            # Protein -> Domain -> SS -> AA
-            transitions = [
-                ('protein', 'domain', 'protein_to_domain'),
-                ('domain', 'ss', 'domain_to_ss'),
-                ('ss', 'aa', 'ss_to_aa')
-            ]
+        Args:
+            features: [batch_size, seq_len, feature_dim]
+            evolutionary_features: Optional coevolution/conservation data
+            return_intermediates: Return intermediate results
             
-        for source, target, message_key in transitions:
-            if source in features and target in features:
-                messages = self._compute_messages(
-                    updated_features[source],
-                    updated_features[target],
-                    hierarchy.get(f'{source}_to_{target}', []),
-                    self.message_functions[message_key]
-                )
-                
-                # Update target features
-                updated_features[target] = self._update_nodes(
-                    updated_features[target],
-                    messages,
-                    self.update_functions[target]
-                )
-                
-        return updated_features
+        Returns:
+            Dictionary with domain predictions and analyses
+        """
+        batch_size, seq_len, _ = features.shape
         
-    def _compute_messages(
-        self,
-        source_features: torch.Tensor,
-        target_features: torch.Tensor,
-        mappings: List[Tuple[int, int]],
-        message_fn: nn.Module
-    ) -> torch.Tensor:
-        """Compute messages from source to target nodes."""
-        # Initialize messages
-        messages = torch.zeros_like(target_features)
+        # Multi-resolution domain detection
+        domain_features = self._multi_resolution_detection(features)
         
-        if not mappings:
-            # If no explicit mapping, use averaging
-            if source_features.dim() == target_features.dim():
-                messages = source_features
-            elif source_features.dim() > target_features.dim():
-                messages = source_features.mean(dim=1, keepdim=True)
-            else:
-                messages = source_features.unsqueeze(1).expand_as(target_features)
+        # Refine domain boundaries
+        refined_features, boundary_scores = self._refine_boundaries(domain_features)
+        
+        # Detect domain regions
+        domain_regions = self._detect_domain_regions(boundary_scores)
+        
+        # Classify domains
+        domain_predictions = self._classify_domains(refined_features, domain_regions)
+        
+        # Detect functional sites within domains
+        functional_sites = self._detect_functional_sites(
+            refined_features, domain_regions
+        )
+        
+        # Apply domain grammar constraints
+        if self.use_domain_grammar:
+            grammar_scores = self.domain_grammar(
+                domain_predictions, domain_regions
+            )
+            domain_predictions = self._apply_grammar_constraints(
+                domain_predictions, grammar_scores
+            )
+            
+        # Analyze coevolution patterns
+        if self.use_coevolution and evolutionary_features is not None:
+            coevolution_patterns = self.coevolution_analyzer(
+                refined_features, evolutionary_features, domain_regions
+            )
         else:
-            # Use provided mappings
-            for source_idx, target_idx in mappings:
-                if source_features.dim() == 3 and target_features.dim() == 3:
-                    combined = torch.cat([
-                        source_features[:, source_idx],
-                        target_features[:, target_idx]
-                    ], dim=-1)
-                    
-                    message = message_fn(combined)
-                    messages[:, target_idx] += message
-                    
-        return messages
+            coevolution_patterns = None
+            
+        # Predict domain interactions
+        interactions = self.interaction_predictor(
+            refined_features, domain_regions
+        )
         
-    def _update_nodes(
+        results = {
+            'domain_regions': domain_regions,
+            'domain_predictions': domain_predictions,
+            'functional_sites': functional_sites,
+            'domain_interactions': interactions,
+            'boundary_scores': boundary_scores
+        }
+        
+        if coevolution_patterns is not None:
+            results['coevolution_patterns'] = coevolution_patterns
+            
+        if return_intermediates:
+            results['multi_res_features'] = domain_features
+            results['refined_features'] = refined_features
+            
+        return results
+        
+    def _multi_resolution_detection(self, features: torch.Tensor) -> torch.Tensor:
+        """Detect domains at multiple resolutions."""
+        # Transpose for convolution
+        features_t = features.transpose(1, 2)  # [batch, feature_dim, seq_len]
+        
+        multi_res_features = []
+        
+        for conv in self.domain_convs:
+            conv_out = F.relu(conv(features_t))
+            
+            # Upsample to original resolution
+            if conv_out.shape[-1] != features.shape[1]:
+                conv_out = F.interpolate(
+                    conv_out,
+                    size=features.shape[1],
+                    mode='linear',
+                    align_corners=False
+                )
+                
+            multi_res_features.append(conv_out)
+            
+        # Concatenate multi-resolution features
+        combined = torch.cat(multi_res_features, dim=1)  # [batch, hidden_dim, seq_len]
+        combined = combined.transpose(1, 2)  # [batch, seq_len, hidden_dim]
+        
+        return combined
+        
+    def _refine_boundaries(
+        self,
+        domain_features: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Refine domain boundaries using LSTM."""
+        # Process with bidirectional LSTM
+        refined, _ = self.boundary_refiner(domain_features)
+        
+        # Compute boundary scores
+        # High score indicates domain boundary
+        diff_features = refined[:, 1:] - refined[:, :-1]
+        boundary_scores = torch.norm(diff_features, dim=-1)
+        
+        # Pad boundary scores
+        boundary_scores = F.pad(boundary_scores, (0, 1), value=0)
+        
+        return refined, boundary_scores
+        
+    def _detect_domain_regions(
+        self,
+        boundary_scores: torch.Tensor,
+        min_domain_length: int = 30
+    ) -> List[List[Tuple[int, int]]]:
+        """Detect domain regions from boundary scores."""
+        batch_size = boundary_scores.shape[0]
+        domain_regions = []
+        
+        for b in range(batch_size):
+            scores = boundary_scores[b].cpu().numpy()
+            
+            # Find peaks in boundary scores
+            from scipy.signal import find_peaks
+            peaks, properties = find_peaks(
+                scores,
+                height=np.percentile(scores, 75),
+                distance=min_domain_length
+            )
+            
+            # Convert peaks to domain regions
+            regions = []
+            if len(peaks) > 0:
+                # Add start if first peak is not at beginning
+                if peaks[0] > min_domain_length:
+                    regions.append((0, peaks[0]))
+                    
+                # Add regions between peaks
+                for i in range(len(peaks) - 1):
+                    if peaks[i+1] - peaks[i] >= min_domain_length:
+                        regions.append((peaks[i], peaks[i+1]))
+                        
+                # Add end if last peak is not at end
+                if len(scores) - peaks[-1] > min_domain_length:
+                    regions.append((peaks[-1], len(scores)))
+            else:
+                # No clear boundaries, treat as single domain
+                regions.append((0, len(scores)))
+                
+            domain_regions.append(regions)
+            
+        return domain_regions
+        
+    def _classify_domains(
         self,
         features: torch.Tensor,
-        messages: torch.Tensor,
-        update_fn: nn.Module
-    ) -> torch.Tensor:
-        """Update node features with messages."""
-        if features.dim() == 3:
-            batch_size, seq_len, hidden_dim = features.shape
-            features_flat = features.view(-1, hidden_dim)
-            messages_flat = messages.view(-1, hidden_dim)
+        domain_regions: List[List[Tuple[int, int]]]
+    ) -> List[List[Dict]]:
+        """Classify each detected domain."""
+        batch_predictions = []
+        
+        for b, regions in enumerate(domain_regions):
+            predictions = []
             
-            updated_flat = update_fn(messages_flat, features_flat)
-            updated = updated_flat.view(batch_size, seq_len, hidden_dim)
-        else:
-            updated = update_fn(messages, features)
+            for start, end in regions:
+                # Extract domain features
+                domain_feat = features[b, start:end].mean(dim=0)
+                
+                # Classify domain
+                class_logits = self.domain_classifier(domain_feat.unsqueeze(0))
+                class_probs = F.softmax(class_logits, dim=-1)
+                
+                top_class = class_probs.argmax(dim=-1).item()
+                confidence = class_probs.max(dim=-1)[0].item()
+                
+                predictions.append({
+                    'start': start,
+                    'end': end,
+                    'domain_class': top_class,
+                    'confidence': confidence,
+                    'class_probs': class_probs.squeeze(0)
+                })
+                
+            batch_predictions.append(predictions)
             
-        return updated
+        return batch_predictions
+        
+    def _detect_functional_sites(
+        self,
+        features: torch.Tensor,
+        domain_regions: List[List[Tuple[int, int]]]
+    ) -> List[List[Dict]]:
+        """Detect functional sites within domains."""
+        batch_sites = []
+        
+        for b, regions in enumerate(domain_regions):
+            domain_sites = []
+            
+            for start, end in regions:
+                # Analyze domain for functional sites
+                domain_features = features[b, start:end]
+                
+                site_predictions = self.functional_site_detector(
+                    domain_features.unsqueeze(0)
+                )
+                
+                # Find high-confidence sites
+                for site_type in range(site_predictions.shape[-1]):
+                    site_probs = site_predictions[0, :, site_type]
+                    site_positions = torch.where(site_probs > 0.7)[0]
+                    
+                    for pos in site_positions:
+                        domain_sites.append({
+                            'position': start + pos.item(),
+                            'site_type': site_type,
+                            'confidence': site_probs[pos].item(),
+                            'domain_region': (start, end)
+                        })
+                        
+            batch_sites.append(domain_sites)
+            
+        return batch_sites
+        
+    def _apply_grammar_constraints(
+        self,
+        predictions: List[List[Dict]],
+        grammar_scores: torch.Tensor
+    ) -> List[List[Dict]]:
+        """Apply domain grammar constraints to refine predictions."""
+        # Adjust domain confidences based on grammar scores
+        for b in range(len(predictions)):
+            for i, domain in enumerate(predictions[b]):
+                if i < grammar_scores.shape[1]:
+                    grammar_weight = grammar_scores[b, i].item()
+                    domain['confidence'] *= (0.5 + 0.5 * grammar_weight)
+                    
+        return predictions
 
 
-class BidirectionalIntegrator(nn.Module):
+class HierarchicalDomainClassifier(nn.Module):
     """
-    Integrates bottom-up and top-down information flows.
+    Hierarchical domain classification with family/subfamily structure.
     """
     
-    def __init__(self, hidden_dim: int, num_heads: int = 8):
+    def __init__(self, input_dim: int, num_classes: int):
+        super().__init__()
+        
+        # Coarse classification (families)
+        self.family_classifier = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(input_dim // 2, num_classes // 10)  # 10 subfamilies per family
+        )
+        
+        # Fine classification (subfamilies)
+        self.subfamily_classifier = nn.Sequential(
+            nn.Linear(input_dim + num_classes // 10, input_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(input_dim // 2, num_classes)
+        )
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Hierarchical classification."""
+        # First level: family
+        family_logits = self.family_classifier(x)
+        family_probs = F.softmax(family_logits, dim=-1)
+        
+        # Second level: subfamily conditioned on family
+        combined = torch.cat([x, family_probs], dim=-1)
+        subfamily_logits = self.subfamily_classifier(combined)
+        
+        return subfamily_logits
+
+
+class FunctionalSiteDetector(nn.Module):
+    """
+    Detect various types of functional sites within domains.
+    """
+    
+    def __init__(self, feature_dim: int, num_site_types: int = 10):
+        super().__init__()
+        
+        self.site_types = [
+            'active_site',
+            'binding_site',
+            'allosteric_site',
+            'catalytic_residue',
+            'regulatory_site',
+            'ptm_site',
+            'metal_binding',
+            'nucleotide_binding',
+            'protein_interface',
+            'dna_binding'
+        ]
+        
+        # Site-specific detectors
+        self.site_detectors = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(feature_dim, 64, kernel_size=7, padding=3),
+                nn.ReLU(),
+                nn.Conv1d(64, 32, kernel_size=5, padding=2),
+                nn.ReLU(),
+                nn.Conv1d(32, 1, kernel_size=3, padding=1),
+                nn.Sigmoid()
+            )
+            for _ in range(num_site_types)
+        ])
+        
+    def forward(self, domain_features: torch.Tensor) -> torch.Tensor:
+        """Detect functional sites."""
+        # domain_features: [batch, seq_len, feature_dim]
+        
+        features_t = domain_features.transpose(1, 2)  # [batch, feature_dim, seq_len]
+        
+        site_predictions = []
+        
+        for detector in self.site_detectors:
+            site_prob = detector(features_t)  # [batch, 1, seq_len]
+            site_predictions.append(site_prob)
+            
+        # Stack predictions
+        sites = torch.cat(site_predictions, dim=1)  # [batch, num_sites, seq_len]
+        sites = sites.transpose(1, 2)  # [batch, seq_len, num_sites]
+        
+        return sites
+
+
+class DomainGrammarModule(nn.Module):
+    """
+    Learn and apply domain arrangement grammar rules.
+    """
+    
+    def __init__(self, hidden_dim: int, num_domain_types: int):
         super().__init__()
         
         self.hidden_dim = hidden_dim
+        self.num_domain_types = num_domain_types
         
-        # Attention for combining bottom-up and top-down
-        self.integration_attention = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
+        # Domain arrangement scorer
+        self.arrangement_lstm = nn.LSTM(
+            input_size=num_domain_types,
+            hidden_size=hidden_dim,
+            num_layers=2,
             batch_first=True
         )
         
-        # Gating mechanism
-        self.bottom_up_gate = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.Sigmoid()
-        )
-        
-        self.top_down_gate = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.Sigmoid()
-        )
-        
-        # Final integration
-        self.final_integration = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim)
-        )
-        
-    def forward(
-        self,
-        bottom_up: Dict[str, torch.Tensor],
-        top_down: Dict[str, torch.Tensor],
-        hierarchy: Dict[str, List[Tuple[int, int]]]
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Integrate bidirectional information flows.
-        """
-        integrated = {}
-        
-        for level in bottom_up.keys():
-            if level in top_down:
-                bu_features = bottom_up[level]
-                td_features = top_down[level]
-                
-                # Ensure same dimensions
-                if bu_features.shape != td_features.shape:
-                    continue
-                    
-                # Compute gates
-                combined = torch.cat([bu_features, td_features], dim=-1)
-                
-                bu_gate = self.bottom_up_gate(combined)
-                td_gate = self.top_down_gate(combined)
-                
-                # Gated combination
-                gated_bu = bu_features * bu_gate
-                gated_td = td_features * td_gate
-                
-                # Attention-based integration
-                if bu_features.dim() == 3:
-                    integrated_attn, _ = self.integration_attention(
-                        gated_bu, gated_td, gated_td
-                    )
-                else:
-                    integrated_attn = (gated_bu + gated_td) / 2
-                    
-                # Final integration
-                final_combined = torch.cat([integrated_attn, gated_bu + gated_td], dim=-1)
-                integrated[level] = self.final_integration(final_combined)
-                
-        return integrated
-
-
-class MultiScaleAttentionIntegrator(nn.Module):
-    """
-    Attention-based integration across multiple scales.
-    """
-    
-    def __init__(
-        self,
-        scale_dims: Dict[str, int],
-        output_dim: int,
-        num_heads: int = 8
-    ):
-        super().__init__()
-        
-        self.scale_dims = scale_dims
-        self.output_dim = output_dim
-        
-        # Scale-specific projections
-        self.scale_projections = nn.ModuleDict({
-            scale: nn.Linear(dim, output_dim)
-            for scale, dim in scale_dims.items()
-        })
-        
-        # Cross-scale attention
-        self.cross_scale_attention = nn.ModuleDict({
-            scale: nn.MultiheadAttention(
-                embed_dim=output_dim,
-                num_heads=num_heads,
-                batch_first=True
-            )
-            for scale in scale_dims.keys()
-        })
-        
-        # Scale importance weights
-        self.scale_importance = nn.Parameter(
-            torch.ones(len(scale_dims)) / len(scale_dims)
-        )
-        
-        # Output network
-        self.output_network = nn.Sequential(
-            nn.Linear(output_dim * len(scale_dims), output_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(output_dim * 2, output_dim),
-            nn.LayerNorm(output_dim)
-        )
-        
-    def forward(
-        self,
-        multi_scale_features: Dict[str, torch.Tensor],
-        target_scale: str = 'aa'
-    ) -> torch.Tensor:
-        """
-        Integrate features from multiple scales.
-        
-        Args:
-            multi_scale_features: Features at different scales
-            target_scale: Target scale for output
-            
-        Returns:
-            Integrated features at target scale
-        """
-        # Project all scales to common dimension
-        projected = {}
-        
-        for scale, features in multi_scale_features.items():
-            if scale in self.scale_projections:
-                projected[scale] = self.scale_projections[scale](features)
-                
-        # Get target scale shape
-        target_shape = multi_scale_features[target_scale].shape[:-1]
-        
-        # Attend from target scale to all scales
-        attended_features = []
-        
-        target_proj = projected[target_scale]
-        
-        for i, (scale, features) in enumerate(projected.items()):
-            # Adjust dimensions if necessary
-            if features.shape[:-1] != target_shape:
-                features = self._adjust_dimensions(features, target_shape)
-                
-            # Cross-scale attention
-            if target_proj.dim() == 3:
-                attended, _ = self.cross_scale_attention[target_scale](
-                    target_proj, features, features
-                )
-            else:
-                attended = features
-                
-            # Apply scale importance
-            attended = attended * self.scale_importance[i]
-            attended_features.append(attended)
-            
-        # Concatenate and process
-        concatenated = torch.cat(attended_features, dim=-1)
-        integrated = self.output_network(concatenated)
-        
-        return integrated
-        
-    def _adjust_dimensions(
-        self,
-        features: torch.Tensor,
-        target_shape: torch.Size
-    ) -> torch.Tensor:
-        """Adjust feature dimensions to match target."""
-        if len(features.shape) == len(target_shape) + 1:
-            # Same number of dimensions
-            if features.dim() == 3 and len(target_shape) == 2:
-                # Interpolate sequence dimension
-                features = F.interpolate(
-                    features.transpose(1, 2),
-                    size=target_shape[1],
-                    mode='linear',
-                    align_corners=False
-                ).transpose(1, 2)
-        elif len(features.shape) < len(target_shape) + 1:
-            # Add dimensions
-            while len(features.shape) < len(target_shape) + 1:
-                features = features.unsqueeze(1)
-            # Expand to target shape
-            expand_shape = list(target_shape) + [features.shape[-1]]
-            features = features.expand(*expand_shape)
-            
-        return features
-
-
-class HierarchicalPooling(nn.Module):
-    """
-    Pooling operations for hierarchical feature aggregation.
-    """
-    
-    def __init__(self, method: str = 'attention'):
-        super().__init__()
-        
-        self.method = method
-        
-        if method == 'attention':
-            self.attention_pooling = AttentionPooling()
-        elif method == 'graph':
-            self.graph_pooling = GraphPooling()
-            
-    def forward(
-        self,
-        features: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        graph: Optional[nx.Graph] = None
-    ) -> torch.Tensor:
-        """
-        Pool features hierarchically.
-        """
-        if self.method == 'attention':
-            return self.attention_pooling(features, mask)
-        elif self.method == 'graph' and graph is not None:
-            return self.graph_pooling(features, graph)
-        else:
-            # Default mean pooling
-            if mask is not None:
-                features = features * mask.unsqueeze(-1)
-                pooled = features.sum(dim=1) / mask.sum(dim=1, keepdim=True)
-            else:
-                pooled = features.mean(dim=1)
-            return pooled
-
-
-class AttentionPooling(nn.Module):
-    """Attention-based pooling."""
-    
-    def __init__(self, hidden_dim: int = 256):
-        super().__init__()
-        
-        self.attention = nn.Sequential(
+        # Grammar rule network
+        self.grammar_scorer = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.Tanh(),
-            nn.Linear(hidden_dim // 2, 1)
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid()
+        )
+        
+        # Common domain patterns (learned)
+        self.pattern_embeddings = nn.Embedding(100, hidden_dim)
+        
+    def forward(
+        self,
+        domain_predictions: List[List[Dict]],
+        domain_regions: List[List[Tuple[int, int]]]
+    ) -> torch.Tensor:
+        """Score domain arrangements based on grammar."""
+        batch_size = len(domain_predictions)
+        max_domains = max(len(preds) for preds in domain_predictions)
+        
+        # Convert predictions to sequence
+        domain_sequences = torch.zeros(batch_size, max_domains, self.num_domain_types)
+        
+        for b, predictions in enumerate(domain_predictions):
+            for i, pred in enumerate(predictions):
+                if i < max_domains:
+                    domain_sequences[b, i] = pred['class_probs']
+                    
+        # Process with LSTM
+        lstm_out, _ = self.arrangement_lstm(domain_sequences)
+        
+        # Score each domain in context
+        grammar_scores = self.grammar_scorer(lstm_out).squeeze(-1)
+        
+        return grammar_scores
+
+
+class CoevolutionAnalyzer(nn.Module):
+    """
+    Analyze coevolution patterns within and between domains.
+    """
+    
+    def __init__(self, feature_dim: int):
+        super().__init__()
+        
+        self.feature_dim = feature_dim
+        
+        # Coevolution pattern detector
+        self.pattern_detector = nn.Sequential(
+            nn.Linear(feature_dim * 2, feature_dim),
+            nn.ReLU(),
+            nn.Linear(feature_dim, feature_dim // 2),
+            nn.ReLU(),
+            nn.Linear(feature_dim // 2, 1),
+            nn.Sigmoid()
         )
         
     def forward(
         self,
-        features: torch.Tensor,
-        mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """Apply attention pooling."""
-        # Compute attention weights
-        attn_weights = self.attention(features).squeeze(-1)
+        domain_features: torch.Tensor,
+        evolutionary_features: torch.Tensor,
+        domain_regions: List[List[Tuple[int, int]]]
+    ) -> Dict[str, torch.Tensor]:
+        """Analyze coevolution patterns."""
+        batch_size = domain_features.shape[0]
+        coevolution_results = []
         
-        if mask is not None:
-            attn_weights = attn_weights.masked_fill(mask == 0, -float('inf'))
+        for b in range(batch_size):
+            domain_coevo = []
             
-        attn_weights = F.softmax(attn_weights, dim=1)
-        
-        # Weighted sum
-        pooled = torch.matmul(attn_weights.unsqueeze(1), features).squeeze(1)
-        
-        return pooled
+            for start, end in domain_regions[b]:
+                # Extract domain-specific features
+                domain_feat = domain_features[b, start:end]
+                evo_feat = evolutionary_features[b, start:end]
+                
+                # Compute pairwise coevolution scores
+                n_positions = end - start
+                coevo_matrix = torch.zeros(n_positions, n_positions)
+                
+                for i in range(n_positions):
+                    for j in range(i + 1, n_positions):
+                        combined = torch.cat([
+                            domain_feat[i] * evo_feat[i],
+                            domain_feat[j] * evo_feat[j]
+                        ])
+                        
+                        coevo_score = self.pattern_detector(combined.unsqueeze(0))
+                        coevo_matrix[i, j] = coevo_score
+                        coevo_matrix[j, i] = coevo_score
+                        
+                domain_coevo.append({
+                    'region': (start, end),
+                    'coevolution_matrix': coevo_matrix,
+                    'coevolution_strength': coevo_matrix.mean().item()
+                })
+                
+            coevolution_results.append(domain_coevo)
+            
+        return {'domain_coevolution': coevolution_results}
 
 
-class GraphPooling(nn.Module):
-    """Graph-based hierarchical pooling."""
+class DomainInteractionPredictor(nn.Module):
+    """
+    Predict interactions between domains.
+    """
     
-    def __init__(self):
+    def __init__(self, domain_dim: int):
         super().__init__()
+        
+        self.interaction_scorer = nn.Sequential(
+            nn.Linear(domain_dim * 2, domain_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(domain_dim, domain_dim // 2),
+            nn.ReLU(),
+            nn.Linear(domain_dim // 2, 1),
+            nn.Sigmoid()
+        )
         
     def forward(
         self,
-        features: torch.Tensor,
-        graph: nx.Graph
-    ) -> torch.Tensor:
-        """Apply graph-based pooling."""
-        # Simplified graph pooling
-        # In practice, would use more sophisticated graph pooling methods
+        domain_features: torch.Tensor,
+        domain_regions: List[List[Tuple[int, int]]]
+    ) -> List[Dict]:
+        """Predict domain-domain interactions."""
+        batch_interactions = []
         
-        pooled_features = []
-        
-        # Pool based on graph communities
-        communities = nx.community.greedy_modularity_communities(graph)
-        
-        for community in communities:
-            community_indices = list(community)
-            if community_indices:
-                community_features = features[:, community_indices].mean(dim=1)
-                pooled_features.append(community_features)
+        for b, regions in enumerate(domain_regions):
+            interactions = []
+            
+            # Get average features for each domain
+            domain_avg_features = []
+            for start, end in regions:
+                avg_feat = domain_features[b, start:end].mean(dim=0)
+                domain_avg_features.append(avg_feat)
                 
-        if pooled_features:
-            return torch.stack(pooled_features, dim=1)
+            # Predict pairwise interactions
+            for i in range(len(regions)):
+                for j in range(i + 1, len(regions)):
+                    combined = torch.cat([
+                        domain_avg_features[i],
+                        domain_avg_features[j]
+                    ])
+                    
+                    interaction_score = self.interaction_scorer(
+                        combined.unsqueeze(0)
+                    ).item()
+                    
+                    if interaction_score > 0.5:  # Threshold
+                        interactions.append({
+                            'domain1': regions[i],
+                            'domain2': regions[j],
+                            'interaction_score': interaction_score,
+                            'interaction_type': self._classify_interaction(
+                                domain_avg_features[i],
+                                domain_avg_features[j]
+                            )
+                        })
+                        
+            batch_interactions.append(interactions)
+            
+        return batch_interactions
+        
+    def _classify_interaction(self, feat1: torch.Tensor, feat2: torch.Tensor) -> str:
+        """Classify type of domain interaction."""
+        # Simplified classification based on feature similarity
+        similarity = F.cosine_similarity(feat1, feat2, dim=0).item()
+        
+        if similarity > 0.8:
+            return 'homotypic'  # Similar domains
+        elif similarity > 0.5:
+            return 'heterotypic_cooperative'  # Different but cooperative
         else:
-            return features.mean(dim=1, keepdim=True)
+            return 'heterotypic_regulatory'  # Regulatory interaction
